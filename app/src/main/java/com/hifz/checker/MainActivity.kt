@@ -7,21 +7,16 @@ import android.content.pm.PackageManager
 import android.graphics.Color
 import android.media.*
 import android.os.Bundle
-import android.text.InputType
 import android.view.View
 import android.view.WindowManager
 import android.widget.*
-import org.json.JSONObject
-import java.net.HttpURLConnection
-import java.net.URL
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
+import org.json.JSONArray
+import java.io.File
 import java.util.concurrent.Executors
 import kotlin.math.sqrt
 
 class MainActivity : Activity() {
     private val SR = 16000
-    private lateinit var urlInput: EditText
     private lateinit var juzSpinner: Spinner
     private lateinit var btn: Button
     private lateinit var status: TextView
@@ -30,9 +25,10 @@ class MainActivity : Activity() {
 
     @Volatile private var running = false
     @Volatile private var pointer = -1
-    @Volatile private var juz = 1
-    @Volatile private var base = ""
-    private val net = Executors.newSingleThreadExecutor()
+    private var ctx = 0L
+    private var loadedJuz = -1
+    private var words: List<Aligner.W> = emptyList()
+    private val worker = Executors.newSingleThreadExecutor()
     private val lines = java.util.Collections.synchronizedList(ArrayList<String>())
 
     override fun onCreate(b: Bundle?) {
@@ -40,7 +36,6 @@ class MainActivity : Activity() {
         tone = ToneGenerator(AudioManager.STREAM_MUSIC, 100)
         val prefs = getSharedPreferences("p", MODE_PRIVATE)
         val pad = (16 * resources.displayMetrics.density).toInt()
-
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(pad, pad, pad, pad)
@@ -51,13 +46,6 @@ class MainActivity : Activity() {
             text = "مراجعة الحفظ"; textSize = 26f; setTextColor(Color.BLACK)
             setPadding(0, 0, 0, pad)
         })
-        urlInput = EditText(this).apply {
-            hint = "رابط السيرفر (https://...)"
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
-            textDirection = View.TEXT_DIRECTION_LTR
-            setText(prefs.getString("url", ""))
-        }
-        root.addView(urlInput)
         juzSpinner = Spinner(this).apply {
             adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item,
                 (1..30).map { "الجزء $it" })
@@ -72,8 +60,7 @@ class MainActivity : Activity() {
         status = TextView(this).apply { textSize = 16f; setPadding(0, pad, 0, pad); setTextColor(Color.DKGRAY) }
         root.addView(status)
         report = TextView(this).apply { textSize = 18f; setTextColor(Color.BLACK) }
-        root.addView(ScrollView(this).apply { addView(report) },
-            LinearLayout.LayoutParams(-1, 0, 1f))
+        root.addView(ScrollView(this).apply { addView(report) }, LinearLayout.LayoutParams(-1, 0, 1f))
         setContentView(root)
     }
 
@@ -87,29 +74,45 @@ class MainActivity : Activity() {
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 1); return
         }
-        var u = urlInput.text.toString().trim().trimEnd('/')
-        if (u.isEmpty()) { status.text = "اكتب رابط السيرفر أولاً"; return }
-        if (!u.startsWith("http")) u = "https://$u"
-        base = u
-        juz = juzSpinner.selectedItemPosition + 1
-        getSharedPreferences("p", MODE_PRIVATE).edit().putString("url", u).putInt("juz", juz - 1).apply()
+        val juz = juzSpinner.selectedItemPosition + 1
+        getSharedPreferences("p", MODE_PRIVATE).edit().putInt("juz", juz - 1).apply()
         lines.clear(); report.text = ""; pointer = -1
         running = true
         btn.text = "إيقاف"
-        status.text = "جاري التحضير… (أول مرة قد تستغرق دقيقة)"
+        status.text = "جاري تجهيز النموذج… (أول مرة قد تستغرق دقيقة)"
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        net.execute {
+        worker.execute {
             try {
-                val c = URL("$base/prepare?juz=$juz").openConnection() as HttpURLConnection
-                c.connectTimeout = 20000; c.readTimeout = 240000
-                if (c.responseCode != 200) throw RuntimeException("HTTP ${c.responseCode}")
-                c.inputStream.close()
+                prepare(juz)
                 if (!running) { runOnUiThread { endUi() }; return@execute }
                 runOnUiThread { status.text = "اقرأ الآن…" }
                 Thread { recordLoop() }.start()
-            } catch (e: Exception) {
-                runOnUiThread { endUi(); status.text = "تعذر الاتصال بالسيرفر: ${e.message}" }
+            } catch (e: Throwable) {
+                runOnUiThread { endUi(); status.text = "تعذر التجهيز: ${e.message}" }
             }
+        }
+    }
+
+    private fun prepare(juz: Int) {
+        if (ctx == 0L) {
+            val f = File(filesDir, "model.bin")
+            val size = assets.openFd("model.bin").use { it.length }
+            if (!f.exists() || f.length() != size) {
+                assets.open("model.bin").use { i -> f.outputStream().use { o -> i.copyTo(o) } }
+            }
+            ctx = Whisper.nativeInit(f.absolutePath)
+            if (ctx == 0L) throw RuntimeException("فشل تحميل النموذج")
+        }
+        if (loadedJuz != juz) {
+            val txt = assets.open("juz/$juz.json").bufferedReader().use { it.readText() }
+            val arr = JSONArray(txt)
+            val list = ArrayList<Triple<Int, Int, String>>()
+            for (i in 0 until arr.length()) {
+                val a = arr.getJSONArray(i)
+                list.add(Triple(a.getInt(0), a.getInt(1), a.getString(2)))
+            }
+            words = Aligner.buildWords(list)
+            loadedJuz = juz
         }
     }
 
@@ -129,7 +132,7 @@ class MainActivity : Activity() {
     @SuppressLint("MissingPermission")
     private fun recordLoop() {
         android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
-        val frame = SR / 10 // 100ms
+        val frame = SR / 10
         val minBuf = AudioRecord.getMinBufferSize(SR, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
         val rec = AudioRecord(MediaRecorder.AudioSource.VOICE_RECOGNITION, SR,
             AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, maxOf(minBuf, frame * 8))
@@ -165,47 +168,41 @@ class MainActivity : Activity() {
         try { rec.stop() } catch (_: Exception) {}
         rec.release()
         if (speaking && speech >= 6) sendSeg(seg)
-        net.execute { runOnUiThread { showReport() } }
+        worker.execute { runOnUiThread { showReport() } }
     }
 
     private fun sendSeg(frames: List<ShortArray>) {
         val total = frames.sumOf { it.size }
-        val bb = ByteBuffer.allocate(total * 2).order(ByteOrder.LITTLE_ENDIAN)
-        for (f in frames) for (x in f) bb.putShort(x)
-        val bytes = bb.array()
-        net.execute {
-            try { upload(bytes) }
-            catch (e: Exception) { runOnUiThread { status.text = "خطأ اتصال: ${e.message}" } }
+        val audio = FloatArray(total)
+        var k = 0
+        for (f in frames) for (x in f) audio[k++] = x / 32768f
+        worker.execute {
+            try { process(audio) }
+            catch (e: Throwable) { runOnUiThread { status.text = "خطأ: ${e.message}" } }
         }
     }
 
-    private fun upload(bytes: ByteArray) {
-        val c = URL("$base/check?juz=$juz&pointer=$pointer").openConnection() as HttpURLConnection
-        c.requestMethod = "POST"; c.doOutput = true
-        c.connectTimeout = 15000; c.readTimeout = 60000
-        c.setRequestProperty("Content-Type", "application/octet-stream")
-        c.setFixedLengthStreamingMode(bytes.size)
-        c.outputStream.use { it.write(bytes) }
-        if (c.responseCode != 200) throw RuntimeException("HTTP ${c.responseCode}")
-        val j = JSONObject(c.inputStream.bufferedReader().use { it.readText() })
-        pointer = j.optInt("pointer", pointer)
-        val errs = j.optJSONArray("errors")
-        if (errs != null && errs.length() > 0) {
+    private fun process(audio: FloatArray) {
+        val threads = minOf(4, Runtime.getRuntime().availableProcessors())
+        val bytes = Whisper.nativeRun(ctx, audio, threads)
+        val text = String(bytes, Charsets.UTF_8)
+        val res = Aligner.evaluate(words, text, pointer)
+        pointer = res.pointer
+        if (res.errors.isNotEmpty()) {
             tone.startTone(ToneGenerator.TONE_SUP_ERROR, 400)
-            for (k in 0 until errs.length()) lines.add(fmt(errs.getJSONObject(k)))
+            for (e in res.errors) lines.add(fmt(e))
         }
-        if (j.optString("status") == "finished") running = false
+        if (res.status == "finished") running = false
     }
 
-    private fun fmt(o: JSONObject): String {
-        val exp = o.optString("expected"); val got = o.optString("got"); val ref = o.optString("ref")
-        val r = if (ref.isNotEmpty()) "[$ref] " else ""
-        return when (o.optString("type")) {
-            "harakat" -> "$r" + "خطأ في الحركة: الصحيح «$exp» وقلت «$got»"
-            "letter" -> "$r" + "خطأ في حرف: الصحيح «$exp» وقلت «$got»"
-            "word" -> "$r" + "كلمة خاطئة: الصحيح «$exp» وقلت «$got»"
-            "missing" -> "$r" + "نسيت كلمة: «$exp»"
-            else -> "كلمة زائدة: «$got»"
+    private fun fmt(e: Aligner.Err): String {
+        val r = if (e.ref.isNotEmpty()) "[${e.ref}] " else ""
+        return when (e.type) {
+            "harakat" -> r + "خطأ في الحركة: الصحيح «${e.expected}» وقلت «${e.got}»"
+            "letter" -> r + "خطأ في حرف: الصحيح «${e.expected}» وقلت «${e.got}»"
+            "word" -> r + "كلمة خاطئة: الصحيح «${e.expected}» وقلت «${e.got}»"
+            "missing" -> r + "نسيت كلمة: «${e.expected}»"
+            else -> "كلمة زائدة: «${e.got}»"
         }
     }
 

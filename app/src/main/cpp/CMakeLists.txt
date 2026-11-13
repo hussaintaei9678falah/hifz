@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.18)
+project(hifzwhisper)
+set(CMAKE_CXX_STANDARD 17)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/whisper.cpp whisper_build)
+add_library(hifzwhisper SHARED whisper_jni.cpp)
+target_link_libraries(hifzwhisper whisper log android)
